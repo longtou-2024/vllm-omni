@@ -247,3 +247,9 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+
+# longtou.2024
+server_log*.txt
+Miniforge3-Linux-x86_64.sh
+activate_python.sh
+conda/

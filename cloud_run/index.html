@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3-TTS Streaming Test</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #f5f7fa; color: #333; padding: 20px; }
+  .container { max-width: 800px; margin: 0 auto; }
+  h1 { text-align: center; margin-bottom: 6px; font-size: 1.6em; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 0.9em; }
+
+  .card { background: #fff; border-radius: 12px; padding: 24px;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 20px; }
+  .card h2 { font-size: 1.1em; margin-bottom: 16px; color: #555; }
+
+  label { display: block; font-weight: 600; margin-bottom: 4px; font-size: 0.85em; color: #555; }
+  textarea, input[type=text], select {
+    width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px;
+    font-size: 0.95em; transition: border-color 0.2s;
+  }
+  textarea:focus, input:focus, select:focus { outline: none; border-color: #4a90d9; }
+  textarea { resize: vertical; min-height: 80px; }
+
+  .row { display: flex; gap: 12px; margin-bottom: 12px; }
+  .row > div { flex: 1; }
+
+  .field { margin-bottom: 12px; }
+  .hidden { display: none; }
+
+  .btn-row { display: flex; gap: 12px; margin-top: 16px; }
+  button {
+    flex: 1; padding: 12px 20px; border: none; border-radius: 8px;
+    font-size: 1em; font-weight: 600; cursor: pointer; transition: all 0.2s;
+  }
+  .btn-primary { background: #4a90d9; color: #fff; }
+  .btn-primary:hover { background: #3a7bc8; }
+  .btn-primary:disabled { background: #a0c4e8; cursor: not-allowed; }
+  .btn-stop { background: #e74c3c; color: #fff; }
+  .btn-stop:hover { background: #c0392b; }
+  .btn-secondary { background: #eee; color: #555; }
+  .btn-secondary:hover { background: #ddd; }
+
+  .status { margin-top: 12px; padding: 10px 14px; border-radius: 8px;
+            font-size: 0.85em; background: #f0f4ff; color: #4a6fa5; min-height: 20px; }
+  .status.error { background: #fef0f0; color: #c0392b; }
+  .status.success { background: #f0fef0; color: #27ae60; }
+
+  #audio-player { width: 100%; margin-top: 12px; }
+
+  .mode-toggle { display: flex; gap: 0; margin-bottom: 16px; border-radius: 8px; overflow: hidden;
+                 border: 1px solid #ddd; }
+  .mode-toggle button { flex: 1; border-radius: 0; border: none; padding: 8px;
+                         background: #f5f5f5; font-size: 0.85em; }
+  .mode-toggle button.active { background: #4a90d9; color: #fff; }
+
+  .log { max-height: 150px; overflow-y: auto; font-family: monospace; font-size: 0.8em;
+         background: #1e1e1e; color: #d4d4d4; padding: 10px; border-radius: 8px;
+         margin-top: 8px; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Qwen3-TTS Streaming Test</h1>
+  <p class="subtitle">vllm-omni TTS 스트리밍 음성합성 테스트</p>
+
+  <!-- Input Card -->
+  <div class="card">
+    <h2>Input</h2>
+    <div class="field">
+      <label for="text-input">Text to Synthesize</label>
+      <textarea id="text-input" placeholder="음성으로 변환할 텍스트를 입력하세요...">안녕하세요. 오늘 날씨가 정말 좋네요. 함께 산책하러 가실래요?</textarea>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="task-type">Task Type</label>
+        <select id="task-type">
+          <option value="CustomVoice" selected>CustomVoice</option>
+          <option value="VoiceDesign">VoiceDesign</option>
+          <option value="Base">Base (Voice Clone)</option>
+        </select>
+      </div>
+      <div>
+        <label for="language">Language</label>
+        <select id="language">
+          <option value="Auto">Auto</option>
+          <option value="Chinese">Chinese</option>
+          <option value="English">English</option>
+          <option value="Japanese">Japanese</option>
+          <option value="Korean" selected>Korean</option>
+          <option value="German">German</option>
+          <option value="French">French</option>
+          <option value="Russian">Russian</option>
+          <option value="Portuguese">Portuguese</option>
+          <option value="Spanish">Spanish</option>
+          <option value="Italian">Italian</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <div id="voice-group">
+        <label for="voice">Voice / Speaker</label>
+        <select id="voice">
+          <option value="Vivian">Vivian</option>
+          <option value="Ryan">Ryan</option>
+          <option value="sohee" selected>sohee</option>
+        </select>
+      </div>
+      <div>
+        <label for="instructions">Instructions (optional)</label>
+        <input type="text" id="instructions" placeholder="e.g., Speak with excitement">
+      </div>
+    </div>
+
+    <!-- Base (voice clone) fields -->
+    <div id="base-fields" class="hidden">
+      <div class="row">
+        <div>
+          <label for="ref-audio-url">Reference Audio URL</label>
+          <input type="text" id="ref-audio-url" placeholder="https://example.com/reference.wav">
+        </div>
+        <div>
+          <label for="ref-text">Reference Transcript</label>
+          <input type="text" id="ref-text" placeholder="Transcript of the reference audio">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Streaming Mode Card -->
+  <div class="card">
+    <h2>Streaming Mode</h2>
+    <div class="mode-toggle">
+      <button id="mode-http" class="active" onclick="setMode('http')">HTTP Streaming</button>
+      <button id="mode-ws" onclick="setMode('ws')">WebSocket</button>
+      <button id="mode-full" onclick="setMode('full')">Full (Non-streaming)</button>
+    </div>
+
+    <div class="btn-row">
+      <button id="btn-generate" class="btn-primary" onclick="generate()">Generate Speech</button>
+      <button id="btn-stop" class="btn-stop hidden" onclick="stopGeneration()">Stop</button>
+      <button class="btn-secondary" onclick="clearAll()">Clear</button>
+    </div>
+
+    <div id="status" class="status">Ready</div>
+    <audio id="audio-player" controls></audio>
+    <div id="log" class="log hidden"></div>
+  </div>
+</div>
+
+<script>
+let currentMode = 'http';
+let abortController = null;
+let wsConnection = null;
+let isGenerating = false;
+
+// PCM config: 24kHz, int16, mono
+const PCM_SAMPLE_RATE = 24000;
+
+// ── Realtime PCM Streaming Player ──
+// Uses Web Audio API to schedule and play PCM chunks as they arrive.
+// Features:
+//   - Pre-buffering: collects PREBUFFER_SECONDS of audio before starting playback
+//     to absorb initial inference latency and network jitter.
+//   - Look-ahead scheduling: adds a small safety margin when scheduling so that
+//     late-arriving chunks can still be queued before a gap occurs.
+//   - Adaptive flush size: monitors inter-chunk arrival jitter and grows the
+//     minimum flush size when the network is unstable.
+class StreamingPCMPlayer {
+  static PREBUFFER_SECONDS = 0.5;           // initial pre-buffer before playback
+  static MIN_FLUSH_SAMPLES = 4800;          // baseline flush size (200ms @ 24kHz)
+  static MAX_FLUSH_SAMPLES = 24000;         // cap adaptive flush (1s @ 24kHz)
+  static SCHEDULE_LOOKAHEAD = 0.05;         // 50ms look-ahead margin
+  static JITTER_ALPHA = 0.3;               // EWMA smoothing for jitter tracking
+
+  constructor(sampleRate) {
+    this.sampleRate = sampleRate;
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+    // Resume AudioContext (browsers require user gesture to start audio)
+    if (this.audioContext.state === 'suspended') {
+      this.audioContext.resume();
+    }
+    this.nextStartTime = 0;
+    this.allChunks = [];          // raw bytes for final WAV export
+    this.totalSamples = 0;
+    this.isPlaying = false;
+    this.pendingBytes = [];       // buffered bytes not yet scheduled
+    this.pendingByteLen = 0;
+
+    // Pre-buffer state
+    this.prebuffering = true;
+    this.prebufferTarget = Math.floor(sampleRate * StreamingPCMPlayer.PREBUFFER_SECONDS) * 2; // bytes
+
+    // Adaptive flush: jitter tracking
+    this.lastFeedTime = 0;
+    this.avgInterval = 0;
+    this.jitter = 0;
+    this.adaptiveFlushSamples = StreamingPCMPlayer.MIN_FLUSH_SAMPLES;
+
+    // Stats
+    this.gapCount = 0;
+  }
+
+  // Feed a Uint8Array of int16 PCM bytes.
+  feed(pcmBytes) {
+    this.allChunks.push(new Uint8Array(pcmBytes));
+    this.pendingBytes.push(pcmBytes);
+    this.pendingByteLen += pcmBytes.length;
+
+    // Track inter-chunk jitter for adaptive flush sizing
+    const now = performance.now();
+    if (this.lastFeedTime > 0) {
+      const interval = now - this.lastFeedTime;
+      const alpha = StreamingPCMPlayer.JITTER_ALPHA;
+      if (this.avgInterval === 0) {
+        this.avgInterval = interval;
+      } else {
+        const deviation = Math.abs(interval - this.avgInterval);
+        this.jitter = this.jitter * (1 - alpha) + deviation * alpha;
+        this.avgInterval = this.avgInterval * (1 - alpha) + interval * alpha;
+      }
+      // Grow flush size proportionally to jitter (more jitter → larger blocks)
+      const jitterSamples = Math.floor((this.jitter / 1000) * this.sampleRate);
+      this.adaptiveFlushSamples = Math.min(
+        StreamingPCMPlayer.MAX_FLUSH_SAMPLES,
+        Math.max(StreamingPCMPlayer.MIN_FLUSH_SAMPLES, jitterSamples * 2)
+      );
+    }
+    this.lastFeedTime = now;
+
+    // Phase 1: pre-buffering — accumulate before starting playback
+    if (this.prebuffering) {
+      if (this.pendingByteLen >= this.prebufferTarget) {
+        this.prebuffering = false;
+        this._flush();
+      }
+      return;
+    }
+
+    // Phase 2: streaming — flush when enough samples accumulated
+    const pendingSamples = Math.floor(this.pendingByteLen / 2);
+    if (pendingSamples >= this.adaptiveFlushSamples) {
+      this._flush();
+    }
+  }
+
+  // Flush remaining buffered audio (call when stream ends).
+  flush() {
+    this.prebuffering = false;
+    if (this.pendingByteLen > 0) {
+      this._flush();
+    }
+  }
+
+  _flush() {
+    // Merge pending byte arrays into one contiguous buffer
+    const merged = new Uint8Array(this.pendingByteLen);
+    let off = 0;
+    for (const b of this.pendingBytes) {
+      merged.set(b, off);
+      off += b.length;
+    }
+
+    // Ensure even byte count (int16 = 2 bytes per sample)
+    const usable = merged.length - (merged.length % 2);
+    this.pendingBytes = usable < merged.length ? [merged.slice(usable)] : [];
+    this.pendingByteLen = merged.length - usable;
+
+    if (usable === 0) return;
+
+    const int16 = new Int16Array(merged.buffer, merged.byteOffset, usable / 2);
+    const numSamples = int16.length;
+
+    // Convert int16 -> float32 for Web Audio API
+    const audioBuffer = this.audioContext.createBuffer(1, numSamples, this.sampleRate);
+    const channelData = audioBuffer.getChannelData(0);
+    for (let i = 0; i < numSamples; i++) {
+      channelData[i] = int16[i] / 32768.0;
+    }
+
+    const source = this.audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(this.audioContext.destination);
+
+    const now = this.audioContext.currentTime;
+    const lookahead = StreamingPCMPlayer.SCHEDULE_LOOKAHEAD;
+
+    if (this.nextStartTime === 0) {
+      // First block: start with look-ahead margin from now
+      const startAt = now + lookahead;
+      source.start(startAt);
+      this.nextStartTime = startAt + audioBuffer.duration;
+    } else if (this.nextStartTime > now) {
+      // On time: schedule seamlessly after previous block
+      source.start(this.nextStartTime);
+      this.nextStartTime += audioBuffer.duration;
+    } else {
+      // Late arrival: gap detected — schedule with look-ahead from now
+      this.gapCount++;
+      const startAt = now + lookahead;
+      source.start(startAt);
+      this.nextStartTime = startAt + audioBuffer.duration;
+    }
+
+    this.totalSamples += numSamples;
+    this.isPlaying = true;
+  }
+
+  stop() {
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      this.audioContext.close().catch(() => {});
+    }
+    this.isPlaying = false;
+  }
+
+  toWavBlob() {
+    const pcmData = concatArrayBuffers(this.allChunks);
+    return pcmToWav(pcmData, this.sampleRate);
+  }
+
+  get durationSeconds() {
+    return this.totalSamples / this.sampleRate;
+  }
+}
+
+// Active streaming player (if any)
+let streamingPlayer = null;
+
+function setMode(mode) {
+  currentMode = mode;
+  document.querySelectorAll('.mode-toggle button').forEach(b => b.classList.remove('active'));
+  document.getElementById('mode-' + mode).classList.add('active');
+}
+
+function setStatus(text, type = '') {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = 'status' + (type ? ' ' + type : '');
+}
+
+function appendLog(text) {
+  const el = document.getElementById('log');
+  el.classList.remove('hidden');
+  el.textContent += text + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearAll() {
+  stopGeneration();
+  document.getElementById('audio-player').src = '';
+  document.getElementById('log').textContent = '';
+  document.getElementById('log').classList.add('hidden');
+  setStatus('Ready');
+}
+
+// Update UI when task type changes
+document.getElementById('task-type').addEventListener('change', function() {
+  const taskType = this.value;
+  document.getElementById('voice-group').classList.toggle('hidden', taskType !== 'CustomVoice');
+  document.getElementById('base-fields').classList.toggle('hidden', taskType !== 'Base');
+});
+
+// Fetch available voices on load (retries while backend is loading)
+async function fetchVoices() {
+  try {
+    const resp = await fetch('/api/voices');
+    const data = await resp.json();
+    if (data.loading) {
+      // Backend still loading - show status and retry
+      setStatus('Backend loading... voices will appear when ready.');
+      setTimeout(fetchVoices, 5000);
+      return;
+    }
+    if (data.voices && data.voices.length > 0) {
+      const select = document.getElementById('voice');
+      select.innerHTML = '';
+      const defaultVoice = 'sohee';
+      data.voices.forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v;
+        if (v === defaultVoice) opt.selected = true;
+        select.appendChild(opt);
+      });
+      setStatus('Ready');
+    }
+  } catch (e) {
+    console.warn('Could not fetch voices:', e);
+    setTimeout(fetchVoices, 5000);
+  }
+}
+fetchVoices();
+
+function buildPayload() {
+  const text = document.getElementById('text-input').value.trim();
+  if (!text) { setStatus('Please enter text', 'error'); return null; }
+
+  const payload = {
+    input: text,
+    task_type: document.getElementById('task-type').value,
+    language: document.getElementById('language').value,
+  };
+
+  const taskType = payload.task_type;
+
+  if (taskType === 'CustomVoice') {
+    payload.voice = document.getElementById('voice').value;
+  }
+
+  const instructions = document.getElementById('instructions').value.trim();
+  if (instructions) payload.instructions = instructions;
+
+  if (taskType === 'Base') {
+    const refUrl = document.getElementById('ref-audio-url').value.trim();
+    const refText = document.getElementById('ref-text').value.trim();
+    if (refUrl) payload.ref_audio = refUrl;
+    if (refText) payload.ref_text = refText;
+  }
+
+  return payload;
+}
+
+function setGenerating(state) {
+  isGenerating = state;
+  document.getElementById('btn-generate').disabled = state;
+  document.getElementById('btn-generate').classList.toggle('hidden', state);
+  document.getElementById('btn-stop').classList.toggle('hidden', !state);
+}
+
+function stopGeneration() {
+  if (abortController) { abortController.abort(); abortController = null; }
+  if (wsConnection) { wsConnection.close(); wsConnection = null; }
+  if (streamingPlayer) { streamingPlayer.stop(); streamingPlayer = null; }
+  setGenerating(false);
+}
+
+async function generate() {
+  const payload = buildPayload();
+  if (!payload) return;
+
+  document.getElementById('log').textContent = '';
+  setGenerating(true);
+
+  try {
+    if (currentMode === 'http') {
+      await generateHTTPStream(payload);
+    } else if (currentMode === 'ws') {
+      await generateWebSocket(payload);
+    } else {
+      await generateFull(payload);
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      setStatus('Error: ' + e.message, 'error');
+      appendLog('ERROR: ' + e.message);
+    }
+  } finally {
+    setGenerating(false);
+  }
+}
+
+// ── HTTP Streaming (realtime playback) ──
+
+// Try to extract JSON metadata trailer from the final chunk.
+// The server appends 4 zero-bytes + JSON after all PCM data.
+function extractTrailer(chunk) {
+  // Search for the 4-zero-byte magic marker from the end
+  // (scan backwards — trailer is always at the tail of the last chunk)
+  const MAGIC = [0, 0, 0, 0];
+  for (let i = chunk.length - 1; i >= 4; i--) {
+    if (chunk[i - 3] === 0 && chunk[i - 2] === 0 && chunk[i - 1] === 0 && chunk[i] === 0) {
+      // Potential marker at i-3..i — try to parse what follows as JSON
+      const jsonStart = i + 1;
+      if (jsonStart >= chunk.length) continue;
+      try {
+        const text = new TextDecoder().decode(chunk.slice(jsonStart));
+        const meta = JSON.parse(text);
+        if (meta._tts_meta) {
+          // Return PCM portion (before marker) and parsed metadata
+          const pcmPart = chunk.slice(0, i - 3);
+          return { pcm: pcmPart, meta };
+        }
+      } catch {
+        // Not valid JSON at this position — keep scanning
+      }
+    }
+  }
+  return null;
+}
+
+async function generateHTTPStream(payload) {
+  setStatus('Streaming audio (HTTP)...');
+  abortController = new AbortController();
+
+  const startTime = performance.now();
+  let totalBytes = 0;
+  let firstChunkTime = null;
+  let serverMeta = null;
+
+  // Create streaming player — plays chunks as they arrive
+  streamingPlayer = new StreamingPCMPlayer(PCM_SAMPLE_RATE);
+
+  const resp = await fetch('/api/tts/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: abortController.signal,
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Server returned ${resp.status}`);
+  }
+
+  const reader = resp.body.getReader();
+  let prevChunk = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    // Feed the *previous* chunk — we hold one chunk back so we can
+    // inspect the very last chunk for a metadata trailer before feeding it.
+    if (prevChunk) {
+      if (done) {
+        // prevChunk is the final chunk — check for trailer
+        const result = extractTrailer(prevChunk);
+        if (result) {
+          serverMeta = result.meta;
+          if (result.pcm.length > 0) {
+            streamingPlayer.feed(result.pcm);
+            totalBytes += result.pcm.length;
+          }
+        } else {
+          streamingPlayer.feed(prevChunk);
+          totalBytes += prevChunk.length;
+        }
+      } else {
+        // Not the last chunk — feed normally
+        streamingPlayer.feed(prevChunk);
+        totalBytes += prevChunk.length;
+      }
+      const duration = streamingPlayer.durationSeconds;
+      const statusExtra = streamingPlayer.prebuffering ? ' (buffering...)' : '';
+      setStatus(`Streaming... ${(totalBytes / 1024).toFixed(1)} KB, ${duration.toFixed(1)}s audio${statusExtra}`);
+    }
+
+    if (done) break;
+
+    if (!firstChunkTime) {
+      firstChunkTime = performance.now();
+      appendLog(`First chunk latency: ${(firstChunkTime - startTime).toFixed(0)}ms`);
+      appendLog(`Pre-buffering ${StreamingPCMPlayer.PREBUFFER_SECONDS}s before playback...`);
+    }
+
+    prevChunk = value;
+  }
+
+  // Flush any remaining buffered audio
+  streamingPlayer.flush();
+
+  const elapsed = performance.now() - startTime;
+  const duration = streamingPlayer.durationSeconds;
+  const gaps = streamingPlayer.gapCount;
+
+  // Client-side RTF
+  const clientRtf = duration > 0 ? (elapsed / 1000) / duration : 0;
+
+  appendLog(`── Client metrics ──`);
+  appendLog(`Audio duration: ${duration.toFixed(2)}s`);
+  appendLog(`Total elapsed: ${(elapsed / 1000).toFixed(2)}s`);
+  appendLog(`Client RTF: ${clientRtf.toFixed(4)}`);
+  appendLog(`Total: ${(totalBytes / 1024).toFixed(1)} KB`);
+
+  if (serverMeta) {
+    appendLog(`── Server metrics ──`);
+    appendLog(`Audio duration: ${serverMeta.audio_duration}s`);
+    appendLog(`Processing time: ${serverMeta.processing_time}s`);
+    appendLog(`TTFB: ${serverMeta.ttfb}s`);
+    appendLog(`Server RTF: ${serverMeta.rtf}`);
+  }
+
+  if (gaps > 0) {
+    appendLog(`⚠ ${gaps} gap(s) detected during playback (late chunk arrivals)`);
+  } else {
+    appendLog(`No gaps detected — seamless playback`);
+  }
+
+  const rtfDisplay = serverMeta ? serverMeta.rtf : clientRtf.toFixed(4);
+  appendLog(`RTF < 1.0 = faster than realtime (good), RTF > 1.0 = slower than realtime (causes stuttering)`);
+
+  // Set WAV in <audio> player for replay/seek after streaming completes
+  const wavBlob = streamingPlayer.toWavBlob();
+  setAudioPlayerBlob(wavBlob);
+
+  setStatus(`Done! ${duration.toFixed(1)}s audio, RTF=${rtfDisplay}` + (gaps > 0 ? `, ${gaps} gap(s)` : ''), 'success');
+  streamingPlayer = null;
+}
+
+// ── WebSocket Streaming (realtime playback) ──
+async function generateWebSocket(payload) {
+  setStatus('Connecting WebSocket...');
+  const startTime = performance.now();
+  let totalBytes = 0;
+  let firstChunkTime = null;
+
+  // Create streaming player
+  streamingPlayer = new StreamingPCMPlayer(PCM_SAMPLE_RATE);
+
+  return new Promise((resolve, reject) => {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${location.host}/api/tts/ws`);
+    wsConnection = ws;
+
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      setStatus('WebSocket connected, sending request...');
+      ws.send(JSON.stringify({
+        text: payload.input,
+        voice: payload.voice || 'Vivian',
+        task_type: payload.task_type || 'CustomVoice',
+        language: payload.language || 'Auto',
+        instructions: payload.instructions || '',
+        response_format: 'pcm',
+        ref_audio: payload.ref_audio || '',
+        ref_text: payload.ref_text || '',
+      }));
+    };
+
+    ws.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        // Binary PCM data — play immediately
+        if (!firstChunkTime) {
+          firstChunkTime = performance.now();
+          appendLog(`First chunk latency: ${(firstChunkTime - startTime).toFixed(0)}ms`);
+          appendLog(`Playing audio...`);
+        }
+
+        const chunk = new Uint8Array(event.data);
+        streamingPlayer.feed(chunk);
+
+        totalBytes += chunk.length;
+        const duration = streamingPlayer.durationSeconds;
+        setStatus(`Streaming (WS)... ${(totalBytes / 1024).toFixed(1)} KB, ${duration.toFixed(1)}s audio`);
+      } else {
+        // JSON control message
+        const msg = JSON.parse(event.data);
+        appendLog(`[${msg.type}] ${msg.sentence_text || msg.message || JSON.stringify(msg)}`);
+
+        if (msg.type === 'session.done') {
+          // Flush any remaining buffered audio
+          streamingPlayer.flush();
+
+          const elapsed = performance.now() - startTime;
+          const duration = streamingPlayer.durationSeconds;
+
+          // Set WAV in <audio> player for replay
+          const wavBlob = streamingPlayer.toWavBlob();
+          setAudioPlayerBlob(wavBlob);
+
+          setStatus(`Done! ${duration.toFixed(1)}s audio, ${(elapsed / 1000).toFixed(2)}s elapsed`, 'success');
+          appendLog(`Total: ${(totalBytes / 1024).toFixed(1)} KB, ${duration.toFixed(1)}s audio in ${(elapsed / 1000).toFixed(2)}s`);
+          streamingPlayer = null;
+          wsConnection = null;
+          resolve();
+        } else if (msg.type === 'error') {
+          reject(new Error(msg.message));
+        }
+      }
+    };
+
+    ws.onerror = () => reject(new Error('WebSocket error'));
+    ws.onclose = () => { wsConnection = null; };
+  });
+}
+
+// ── Full (Non-streaming) ──
+async function generateFull(payload) {
+  setStatus('Generating audio (non-streaming)...');
+  abortController = new AbortController();
+  const startTime = performance.now();
+
+  payload.response_format = 'wav';
+
+  const resp = await fetch('/api/tts/full', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: abortController.signal,
+  });
+
+  if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
+
+  const rtf = resp.headers.get('X-RTF');
+  const audioDuration = resp.headers.get('X-Audio-Duration');
+  const processingTime = resp.headers.get('X-Processing-Time');
+
+  const blob = await resp.blob();
+  const elapsed = performance.now() - startTime;
+
+  playAudioBlob(blob);
+
+  if (rtf && audioDuration) {
+    appendLog(`Audio duration: ${parseFloat(audioDuration).toFixed(2)}s`);
+    appendLog(`Processing time: ${parseFloat(processingTime).toFixed(2)}s`);
+    appendLog(`RTF: ${parseFloat(rtf).toFixed(4)} (lower is better, <1.0 = faster than realtime)`);
+    appendLog(`Total: ${(blob.size / 1024).toFixed(1)} KB`);
+    setStatus(`Done! ${parseFloat(audioDuration).toFixed(1)}s audio, RTF=${parseFloat(rtf).toFixed(4)}`, 'success');
+  } else {
+    appendLog(`Total: ${(blob.size / 1024).toFixed(1)} KB in ${(elapsed / 1000).toFixed(2)}s`);
+    setStatus(`Done! ${(blob.size / 1024).toFixed(1)} KB, ${(elapsed / 1000).toFixed(2)}s`, 'success');
+  }
+}
+
+// ── Audio Utilities ──
+function concatArrayBuffers(arrays) {
+  let totalLen = 0;
+  arrays.forEach(a => totalLen += a.length);
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  arrays.forEach(a => { result.set(a, offset); offset += a.length; });
+  return result;
+}
+
+function pcmToWav(pcmData, sampleRate) {
+  const buffer = new ArrayBuffer(44 + pcmData.length);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + pcmData.length, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);           // PCM format
+  view.setUint16(22, 1, true);           // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);           // block align
+  view.setUint16(34, 16, true);          // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, pcmData.length, true);
+
+  new Uint8Array(buffer, 44).set(pcmData);
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+// Set WAV blob on <audio> element for replay/seek (does NOT auto-play)
+function setAudioPlayerBlob(blob) {
+  const url = URL.createObjectURL(blob);
+  const player = document.getElementById('audio-player');
+  player.src = url;
+}
+
+// Play blob immediately via <audio> element (used for non-streaming mode)
+function playAudioBlob(blob) {
+  const url = URL.createObjectURL(blob);
+  const player = document.getElementById('audio-player');
+  player.src = url;
+  player.play().catch(() => {});
+}
+</script>
+</body>
+</html>
