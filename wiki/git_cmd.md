@@ -1,4 +1,4 @@
-# git sync 후 절차
+# after github sync main branch
 절차
 
   1. origin의 최신 상태 가져오기

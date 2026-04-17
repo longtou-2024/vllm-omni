@@ -37,7 +37,7 @@ fi
 # vllm-omni는 vllm에 의존하지만 entrypoint 충돌 때문에 requirements에서
 # 의도적으로 제외되어 있음. vllm을 먼저 설치하고 vllm-omni를 나중에 설치하면
 # vllm-omni의 엔트리포인트가 우선됨.
-VLLM_VERSION="${VLLM_VERSION:-0.19.0}"
+VLLM_VERSION="${VLLM_VERSION:-0.18.0}"
 if ! python -c "import vllm" &>/dev/null; then
     echo "Installing vllm ${VLLM_VERSION} …"
     uv pip install "vllm==${VLLM_VERSION}"

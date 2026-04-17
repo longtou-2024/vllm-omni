@@ -101,32 +101,49 @@
       </div>
     </div>
 
-    <div class="row">
-      <div id="voice-group">
-        <label for="voice">Voice / Speaker</label>
-        <select id="voice">
-          <option value="Vivian">Vivian</option>
-          <option value="Ryan">Ryan</option>
-          <option value="sohee" selected>sohee</option>
-        </select>
+    <!-- CustomVoice fields -->
+    <div id="customvoice-fields">
+      <div class="row">
+        <div>
+          <label for="voice">Voice / Speaker</label>
+          <select id="voice">
+            <option value="Vivian">Vivian</option>
+            <option value="Ryan">Ryan</option>
+            <option value="sohee" selected>sohee</option>
+          </select>
+        </div>
+        <div>
+          <label for="instructions">Style Instructions <span style="color:#aaa">(optional)</span></label>
+          <input type="text" id="instructions" placeholder="e.g., Speak with excitement and warmth">
+        </div>
       </div>
-      <div>
-        <label for="instructions">Instructions (optional)</label>
-        <input type="text" id="instructions" placeholder="e.g., Speak with excitement">
+    </div>
+
+    <!-- VoiceDesign fields -->
+    <div id="voicedesign-fields" class="hidden">
+      <div class="field">
+        <label for="voice-description">Voice Description <span style="color:#c0392b">*</span></label>
+        <textarea id="voice-description" rows="2"
+          placeholder="e.g., A deep, calm male voice with a slight British accent, speaking at a moderate pace"></textarea>
       </div>
     </div>
 
     <!-- Base (voice clone) fields -->
     <div id="base-fields" class="hidden">
-      <div class="row">
-        <div>
-          <label for="ref-audio-url">Reference Audio URL</label>
-          <input type="text" id="ref-audio-url" placeholder="https://example.com/reference.wav">
-        </div>
-        <div>
-          <label for="ref-text">Reference Transcript</label>
-          <input type="text" id="ref-text" placeholder="Transcript of the reference audio">
-        </div>
+      <div class="field">
+        <label for="ref-audio-file">Reference Audio File <span style="color:#c0392b">*</span>
+          <span style="color:#aaa; font-weight:normal">(1~30s audio, uploaded as base64)</span>
+        </label>
+        <input type="file" id="ref-audio-file" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a">
+        <div id="ref-audio-file-info" style="font-size:0.8em; color:#888; margin-top:4px;"></div>
+      </div>
+      <div class="field">
+        <label for="ref-audio-url">…or Reference Audio URL <span style="color:#aaa">(alternative to file)</span></label>
+        <input type="text" id="ref-audio-url" placeholder="https://example.com/reference.wav">
+      </div>
+      <div class="field">
+        <label for="ref-text">Reference Transcript <span style="color:#aaa">(optional, improves quality via ICL)</span></label>
+        <input type="text" id="ref-text" placeholder="Transcript of the reference audio">
       </div>
     </div>
   </div>
@@ -135,14 +152,14 @@
   <div class="card">
     <h2>Streaming Mode</h2>
     <div class="mode-toggle">
-      <button id="mode-http" class="active" onclick="setMode('http')">HTTP Streaming</button>
-      <button id="mode-ws" onclick="setMode('ws')">WebSocket</button>
-      <button id="mode-full" onclick="setMode('full')">Full (Non-streaming)</button>
+      <button id="mode-http" class="active" onclick="setMode('http')">Streaming</button>
+      <button id="mode-full" onclick="setMode('full')">Non-streaming</button>
     </div>
 
     <div class="btn-row">
       <button id="btn-generate" class="btn-primary" onclick="generate()">Generate Speech</button>
       <button id="btn-stop" class="btn-stop hidden" onclick="stopGeneration()">Stop</button>
+      <button id="btn-replay" class="btn-secondary hidden" onclick="replay()">Replay</button>
       <button class="btn-secondary" onclick="clearAll()">Clear</button>
     </div>
 
@@ -155,166 +172,149 @@
 <script>
 let currentMode = 'http';
 let abortController = null;
-let wsConnection = null;
 let isGenerating = false;
+let lastWavBlob = null;
 
 // PCM config: 24kHz, int16, mono
 const PCM_SAMPLE_RATE = 24000;
 
 // ── Realtime PCM Streaming Player ──
-// Uses Web Audio API to schedule and play PCM chunks as they arrive.
-// Features:
-//   - Pre-buffering: collects PREBUFFER_SECONDS of audio before starting playback
-//     to absorb initial inference latency and network jitter.
-//   - Look-ahead scheduling: adds a small safety margin when scheduling so that
-//     late-arriving chunks can still be queued before a gap occurs.
-//   - Adaptive flush size: monitors inter-chunk arrival jitter and grows the
-//     minimum flush size when the network is unstable.
+// Decodes int16 PCM chunks as they arrive and schedules them on a
+// WebAudio AudioContext so playback starts as soon as enough data has
+// buffered (PREBUFFER_SECONDS) and continues seamlessly.
+//
+// HTTP chunk boundaries don't align to PCM sample boundaries (int16 = 2
+// bytes/sample), so we maintain a rolling byte buffer and carry over any
+// orphan byte to the next scheduling pass — otherwise the following
+// chunk would start mid-sample and produce crackle/noise.
+//
+// Raw PCM bytes are also retained so the final audio can be exported as
+// a WAV blob for replay/download.
 class StreamingPCMPlayer {
-  static PREBUFFER_SECONDS = 0.5;           // initial pre-buffer before playback
-  static MIN_FLUSH_SAMPLES = 4800;          // baseline flush size (200ms @ 24kHz)
-  static MAX_FLUSH_SAMPLES = 24000;         // cap adaptive flush (1s @ 24kHz)
-  static SCHEDULE_LOOKAHEAD = 0.05;         // 50ms look-ahead margin
-  static JITTER_ALPHA = 0.3;               // EWMA smoothing for jitter tracking
+  static PREBUFFER_SECONDS = 0.3;
+  // Schedule in chunks of at least this many samples once playback is
+  // live, to avoid the overhead of many tiny AudioBufferSourceNodes.
+  static MIN_SCHEDULE_SECONDS = 0.02;
 
   constructor(sampleRate) {
     this.sampleRate = sampleRate;
-    this.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
-    // Resume AudioContext (browsers require user gesture to start audio)
-    if (this.audioContext.state === 'suspended') {
-      this.audioContext.resume();
-    }
-    this.nextStartTime = 0;
-    this.allChunks = [];          // raw bytes for final WAV export
+    this.minScheduleSamples = Math.floor(sampleRate * StreamingPCMPlayer.MIN_SCHEDULE_SECONDS);
+
+    // Keep raw PCM bytes for toWavBlob()
+    this.allChunks = [];
+    this.totalBytes = 0;
     this.totalSamples = 0;
-    this.isPlaying = false;
-    this.pendingBytes = [];       // buffered bytes not yet scheduled
-    this.pendingByteLen = 0;
 
-    // Pre-buffer state
+    // Rolling byte buffer holding PCM data not yet scheduled.
+    // Handles both (a) sample-boundary carry-over and (b) accumulation
+    // up to prebuffer/min-schedule thresholds.
+    this.pending = new Uint8Array(0);
+
+    // WebAudio state
+    this.audioCtx = null;
+    this.gainNode = null;
+    this.nextStartTime = 0;
+    this.activeSources = new Set();
+
     this.prebuffering = true;
-    this.prebufferTarget = Math.floor(sampleRate * StreamingPCMPlayer.PREBUFFER_SECONDS) * 2; // bytes
-
-    // Adaptive flush: jitter tracking
-    this.lastFeedTime = 0;
-    this.avgInterval = 0;
-    this.jitter = 0;
-    this.adaptiveFlushSamples = StreamingPCMPlayer.MIN_FLUSH_SAMPLES;
-
-    // Stats
-    this.gapCount = 0;
+    this.stopped = false;
   }
 
-  // Feed a Uint8Array of int16 PCM bytes.
+  _ensureContext() {
+    if (this.audioCtx) return;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    this.audioCtx = new Ctor({ sampleRate: this.sampleRate });
+    this.gainNode = this.audioCtx.createGain();
+    this.gainNode.connect(this.audioCtx.destination);
+    this.nextStartTime = this.audioCtx.currentTime;
+  }
+
+  _appendPending(chunk) {
+    if (chunk.byteLength === 0) return;
+    const merged = new Uint8Array(this.pending.byteLength + chunk.byteLength);
+    merged.set(this.pending, 0);
+    merged.set(chunk, this.pending.byteLength);
+    this.pending = merged;
+  }
+
+  // Schedule as many whole samples as possible from `this.pending`, and
+  // keep the orphan byte (if byteLength is odd) for the next pass.
+  _scheduleFromPending() {
+    const usableLen = this.pending.byteLength & ~1;  // floor to even
+    if (usableLen === 0) return;
+
+    // Copy out the even-byte prefix so int16 view has byteOffset=0 and
+    // the backing buffer won't change underneath us.
+    const pcm = this.pending.slice(0, usableLen);
+    this.pending = this.pending.slice(usableLen);  // carry-over byte (0 or 1)
+
+    const int16 = new Int16Array(pcm.buffer, 0, usableLen / 2);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768;
+    }
+
+    const buffer = this.audioCtx.createBuffer(1, float32.length, this.sampleRate);
+    buffer.copyToChannel(float32, 0);
+
+    const source = this.audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.gainNode);
+
+    const startTime = Math.max(this.audioCtx.currentTime, this.nextStartTime);
+    source.start(startTime);
+    this.nextStartTime = startTime + buffer.duration;
+
+    this.activeSources.add(source);
+    source.onended = () => this.activeSources.delete(source);
+  }
+
   feed(pcmBytes) {
-    this.allChunks.push(new Uint8Array(pcmBytes));
-    this.pendingBytes.push(pcmBytes);
-    this.pendingByteLen += pcmBytes.length;
+    if (this.stopped) return;
+    const chunk = new Uint8Array(pcmBytes);
+    if (chunk.byteLength === 0) return;
 
-    // Track inter-chunk jitter for adaptive flush sizing
-    const now = performance.now();
-    if (this.lastFeedTime > 0) {
-      const interval = now - this.lastFeedTime;
-      const alpha = StreamingPCMPlayer.JITTER_ALPHA;
-      if (this.avgInterval === 0) {
-        this.avgInterval = interval;
-      } else {
-        const deviation = Math.abs(interval - this.avgInterval);
-        this.jitter = this.jitter * (1 - alpha) + deviation * alpha;
-        this.avgInterval = this.avgInterval * (1 - alpha) + interval * alpha;
-      }
-      // Grow flush size proportionally to jitter (more jitter → larger blocks)
-      const jitterSamples = Math.floor((this.jitter / 1000) * this.sampleRate);
-      this.adaptiveFlushSamples = Math.min(
-        StreamingPCMPlayer.MAX_FLUSH_SAMPLES,
-        Math.max(StreamingPCMPlayer.MIN_FLUSH_SAMPLES, jitterSamples * 2)
-      );
-    }
-    this.lastFeedTime = now;
+    this.allChunks.push(chunk);
+    this.totalBytes += chunk.byteLength;
+    this.totalSamples = Math.floor(this.totalBytes / 2);
 
-    // Phase 1: pre-buffering — accumulate before starting playback
+    this._ensureContext();
+    this._appendPending(chunk);
+
+    const pendingSamples = this.pending.byteLength >> 1;
+
     if (this.prebuffering) {
-      if (this.pendingByteLen >= this.prebufferTarget) {
+      const threshold = StreamingPCMPlayer.PREBUFFER_SECONDS * this.sampleRate;
+      if (pendingSamples >= threshold) {
         this.prebuffering = false;
-        this._flush();
+        this._scheduleFromPending();
       }
-      return;
-    }
-
-    // Phase 2: streaming — flush when enough samples accumulated
-    const pendingSamples = Math.floor(this.pendingByteLen / 2);
-    if (pendingSamples >= this.adaptiveFlushSamples) {
-      this._flush();
+    } else if (pendingSamples >= this.minScheduleSamples) {
+      this._scheduleFromPending();
     }
   }
 
-  // Flush remaining buffered audio (call when stream ends).
+  // End of stream — schedule whatever remains, even if below thresholds.
+  // An orphan single byte at the very end is dropped (can't form a sample).
   flush() {
+    if (this.stopped || !this.audioCtx) return;
     this.prebuffering = false;
-    if (this.pendingByteLen > 0) {
-      this._flush();
+    if (this.pending.byteLength >= 2) {
+      this._scheduleFromPending();
     }
-  }
-
-  _flush() {
-    // Merge pending byte arrays into one contiguous buffer
-    const merged = new Uint8Array(this.pendingByteLen);
-    let off = 0;
-    for (const b of this.pendingBytes) {
-      merged.set(b, off);
-      off += b.length;
-    }
-
-    // Ensure even byte count (int16 = 2 bytes per sample)
-    const usable = merged.length - (merged.length % 2);
-    this.pendingBytes = usable < merged.length ? [merged.slice(usable)] : [];
-    this.pendingByteLen = merged.length - usable;
-
-    if (usable === 0) return;
-
-    const int16 = new Int16Array(merged.buffer, merged.byteOffset, usable / 2);
-    const numSamples = int16.length;
-
-    // Convert int16 -> float32 for Web Audio API
-    const audioBuffer = this.audioContext.createBuffer(1, numSamples, this.sampleRate);
-    const channelData = audioBuffer.getChannelData(0);
-    for (let i = 0; i < numSamples; i++) {
-      channelData[i] = int16[i] / 32768.0;
-    }
-
-    const source = this.audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(this.audioContext.destination);
-
-    const now = this.audioContext.currentTime;
-    const lookahead = StreamingPCMPlayer.SCHEDULE_LOOKAHEAD;
-
-    if (this.nextStartTime === 0) {
-      // First block: start with look-ahead margin from now
-      const startAt = now + lookahead;
-      source.start(startAt);
-      this.nextStartTime = startAt + audioBuffer.duration;
-    } else if (this.nextStartTime > now) {
-      // On time: schedule seamlessly after previous block
-      source.start(this.nextStartTime);
-      this.nextStartTime += audioBuffer.duration;
-    } else {
-      // Late arrival: gap detected — schedule with look-ahead from now
-      this.gapCount++;
-      const startAt = now + lookahead;
-      source.start(startAt);
-      this.nextStartTime = startAt + audioBuffer.duration;
-    }
-
-    this.totalSamples += numSamples;
-    this.isPlaying = true;
   }
 
   stop() {
-    if (this.audioContext && this.audioContext.state !== 'closed') {
-      this.audioContext.close().catch(() => {});
+    this.stopped = true;
+    for (const source of this.activeSources) {
+      try { source.stop(); } catch (_) { /* already stopped */ }
     }
-    this.isPlaying = false;
+    this.activeSources.clear();
+    if (this.audioCtx) {
+      this.audioCtx.close().catch(() => {});
+      this.audioCtx = null;
+      this.gainNode = null;
+    }
   }
 
   toWavBlob() {
@@ -349,20 +349,48 @@ function appendLog(text) {
   el.scrollTop = el.scrollHeight;
 }
 
+function replay() {
+  if (!lastWavBlob) return;
+  const player = document.getElementById('audio-player');
+  player.src = URL.createObjectURL(lastWavBlob);
+  player.play().catch(() => {});
+}
+
 function clearAll() {
   stopGeneration();
+  lastWavBlob = null;
+  document.getElementById('btn-replay').classList.add('hidden');
   document.getElementById('audio-player').src = '';
   document.getElementById('log').textContent = '';
   document.getElementById('log').classList.add('hidden');
   setStatus('Ready');
 }
 
-// Update UI when task type changes
-document.getElementById('task-type').addEventListener('change', function() {
-  const taskType = this.value;
-  document.getElementById('voice-group').classList.toggle('hidden', taskType !== 'CustomVoice');
+// Update UI when task type changes — show only relevant fields
+function updateTaskTypeUI() {
+  const taskType = document.getElementById('task-type').value;
+  document.getElementById('customvoice-fields').classList.toggle('hidden', taskType !== 'CustomVoice');
+  document.getElementById('voicedesign-fields').classList.toggle('hidden', taskType !== 'VoiceDesign');
   document.getElementById('base-fields').classList.toggle('hidden', taskType !== 'Base');
-});
+}
+document.getElementById('task-type').addEventListener('change', updateTaskTypeUI);
+
+// Fetch backend status on load
+async function fetchBackends() {
+  try {
+    const resp = await fetch('/api/backends');
+    const data = await resp.json();
+    const parts = [];
+    for (const [tt, info] of Object.entries(data)) {
+      const icon = info.ready ? '\u2705' : '\u23F3';
+      parts.push(`${icon} ${tt}`);
+    }
+    if (parts.length > 0) {
+      document.querySelector('.subtitle').textContent = parts.join('  |  ');
+    }
+  } catch (e) { /* ignore */ }
+}
+fetchBackends();
 
 // Fetch available voices on load (retries while backend is loading)
 async function fetchVoices() {
@@ -395,34 +423,76 @@ async function fetchVoices() {
 }
 fetchVoices();
 
-function buildPayload() {
+// Read a File into a base64 `data:` URL that the backend's
+// _validate_ref_audio_format() accepts as ref_audio.
+function fileToDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('File read failed'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function buildPayload() {
   const text = document.getElementById('text-input').value.trim();
   if (!text) { setStatus('Please enter text', 'error'); return null; }
 
+  const taskType = document.getElementById('task-type').value;
   const payload = {
     input: text,
-    task_type: document.getElementById('task-type').value,
+    task_type: taskType,
     language: document.getElementById('language').value,
   };
 
-  const taskType = payload.task_type;
-
   if (taskType === 'CustomVoice') {
     payload.voice = document.getElementById('voice').value;
-  }
+    const instructions = document.getElementById('instructions').value.trim();
+    if (instructions) payload.instructions = instructions;
 
-  const instructions = document.getElementById('instructions').value.trim();
-  if (instructions) payload.instructions = instructions;
+  } else if (taskType === 'VoiceDesign') {
+    const desc = document.getElementById('voice-description').value.trim();
+    if (!desc) { setStatus('Voice description is required for VoiceDesign', 'error'); return null; }
+    payload.instructions = desc;
 
-  if (taskType === 'Base') {
+  } else if (taskType === 'Base') {
+    // File upload takes priority over URL. One of the two must be provided.
+    const fileInput = document.getElementById('ref-audio-file');
     const refUrl = document.getElementById('ref-audio-url').value.trim();
+    const file = fileInput && fileInput.files && fileInput.files[0];
+
+    if (file) {
+      setStatus(`Reading ${file.name} (${(file.size / 1024).toFixed(1)} KB) ...`);
+      try {
+        payload.ref_audio = await fileToDataURL(file);
+      } catch (e) {
+        setStatus(`Failed to read file: ${e.message}`, 'error');
+        return null;
+      }
+    } else if (refUrl) {
+      payload.ref_audio = refUrl;
+    } else {
+      setStatus('Reference audio file or URL is required for Base (Voice Clone)', 'error');
+      return null;
+    }
+
     const refText = document.getElementById('ref-text').value.trim();
-    if (refUrl) payload.ref_audio = refUrl;
     if (refText) payload.ref_text = refText;
   }
 
   return payload;
 }
+
+// Show selected file name/size under the file input.
+document.getElementById('ref-audio-file').addEventListener('change', (e) => {
+  const info = document.getElementById('ref-audio-file-info');
+  const file = e.target.files && e.target.files[0];
+  if (file) {
+    info.textContent = `Selected: ${file.name} (${(file.size / 1024).toFixed(1)} KB, ${file.type || 'audio'})`;
+  } else {
+    info.textContent = '';
+  }
+});
 
 function setGenerating(state) {
   isGenerating = state;
@@ -433,13 +503,12 @@ function setGenerating(state) {
 
 function stopGeneration() {
   if (abortController) { abortController.abort(); abortController = null; }
-  if (wsConnection) { wsConnection.close(); wsConnection = null; }
   if (streamingPlayer) { streamingPlayer.stop(); streamingPlayer = null; }
   setGenerating(false);
 }
 
 async function generate() {
-  const payload = buildPayload();
+  const payload = await buildPayload();
   if (!payload) return;
 
   document.getElementById('log').textContent = '';
@@ -448,8 +517,6 @@ async function generate() {
   try {
     if (currentMode === 'http') {
       await generateHTTPStream(payload);
-    } else if (currentMode === 'ws') {
-      await generateWebSocket(payload);
     } else {
       await generateFull(payload);
     }
@@ -495,6 +562,10 @@ function extractTrailer(chunk) {
 async function generateHTTPStream(payload) {
   setStatus('Streaming audio (HTTP)...');
   abortController = new AbortController();
+
+  // Clean up previous state
+  document.getElementById('audio-player').src = '';
+  if (streamingPlayer) { streamingPlayer.stop(); streamingPlayer = null; }
 
   const startTime = performance.now();
   let totalBytes = 0;
@@ -563,7 +634,6 @@ async function generateHTTPStream(payload) {
 
   const elapsed = performance.now() - startTime;
   const duration = streamingPlayer.durationSeconds;
-  const gaps = streamingPlayer.gapCount;
 
   // Client-side RTF
   const clientRtf = duration > 0 ? (elapsed / 1000) / duration : 0;
@@ -582,105 +652,29 @@ async function generateHTTPStream(payload) {
     appendLog(`Server RTF: ${serverMeta.rtf}`);
   }
 
-  if (gaps > 0) {
-    appendLog(`⚠ ${gaps} gap(s) detected during playback (late chunk arrivals)`);
-  } else {
-    appendLog(`No gaps detected — seamless playback`);
-  }
-
   const rtfDisplay = serverMeta ? serverMeta.rtf : clientRtf.toFixed(4);
-  appendLog(`RTF < 1.0 = faster than realtime (good), RTF > 1.0 = slower than realtime (causes stuttering)`);
 
-  // Set WAV in <audio> player for replay/seek after streaming completes
-  const wavBlob = streamingPlayer.toWavBlob();
-  setAudioPlayerBlob(wavBlob);
+  setStatus(`Done! ${duration.toFixed(1)}s audio, RTF=${rtfDisplay}`, 'success');
 
-  setStatus(`Done! ${duration.toFixed(1)}s audio, RTF=${rtfDisplay}` + (gaps > 0 ? `, ${gaps} gap(s)` : ''), 'success');
-  streamingPlayer = null;
-}
-
-// ── WebSocket Streaming (realtime playback) ──
-async function generateWebSocket(payload) {
-  setStatus('Connecting WebSocket...');
-  const startTime = performance.now();
-  let totalBytes = 0;
-  let firstChunkTime = null;
-
-  // Create streaming player
-  streamingPlayer = new StreamingPCMPlayer(PCM_SAMPLE_RATE);
-
-  return new Promise((resolve, reject) => {
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${location.host}/api/tts/ws`);
-    wsConnection = ws;
-
-    ws.binaryType = 'arraybuffer';
-
-    ws.onopen = () => {
-      setStatus('WebSocket connected, sending request...');
-      ws.send(JSON.stringify({
-        text: payload.input,
-        voice: payload.voice || 'Vivian',
-        task_type: payload.task_type || 'CustomVoice',
-        language: payload.language || 'Auto',
-        instructions: payload.instructions || '',
-        response_format: 'pcm',
-        ref_audio: payload.ref_audio || '',
-        ref_text: payload.ref_text || '',
-      }));
-    };
-
-    ws.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        // Binary PCM data — play immediately
-        if (!firstChunkTime) {
-          firstChunkTime = performance.now();
-          appendLog(`First chunk latency: ${(firstChunkTime - startTime).toFixed(0)}ms`);
-          appendLog(`Playing audio...`);
-        }
-
-        const chunk = new Uint8Array(event.data);
-        streamingPlayer.feed(chunk);
-
-        totalBytes += chunk.length;
-        const duration = streamingPlayer.durationSeconds;
-        setStatus(`Streaming (WS)... ${(totalBytes / 1024).toFixed(1)} KB, ${duration.toFixed(1)}s audio`);
-      } else {
-        // JSON control message
-        const msg = JSON.parse(event.data);
-        appendLog(`[${msg.type}] ${msg.sentence_text || msg.message || JSON.stringify(msg)}`);
-
-        if (msg.type === 'session.done') {
-          // Flush any remaining buffered audio
-          streamingPlayer.flush();
-
-          const elapsed = performance.now() - startTime;
-          const duration = streamingPlayer.durationSeconds;
-
-          // Set WAV in <audio> player for replay
-          const wavBlob = streamingPlayer.toWavBlob();
-          setAudioPlayerBlob(wavBlob);
-
-          setStatus(`Done! ${duration.toFixed(1)}s audio, ${(elapsed / 1000).toFixed(2)}s elapsed`, 'success');
-          appendLog(`Total: ${(totalBytes / 1024).toFixed(1)} KB, ${duration.toFixed(1)}s audio in ${(elapsed / 1000).toFixed(2)}s`);
-          streamingPlayer = null;
-          wsConnection = null;
-          resolve();
-        } else if (msg.type === 'error') {
-          reject(new Error(msg.message));
-        }
-      }
-    };
-
-    ws.onerror = () => reject(new Error('WebSocket error'));
-    ws.onclose = () => { wsConnection = null; };
-  });
+  // Realtime playback already happened via Web Audio API during the
+  // stream. Load the final WAV into the <audio> element only so that
+  // the user can replay/seek — do not auto-play (would double-play).
+  lastWavBlob = streamingPlayer.toWavBlob();
+  document.getElementById('btn-replay').classList.remove('hidden');
+  setAudioPlayerBlob(lastWavBlob);
+  // Keep the streamingPlayer reference so post-stream audio tails can be
+  // stopped by the cleanup block on the next Generate/Stop/Clear click.
 }
 
 // ── Full (Non-streaming) ──
 async function generateFull(payload) {
   setStatus('Generating audio (non-streaming)...');
   abortController = new AbortController();
+
+  // Clean up previous state
+  document.getElementById('audio-player').src = '';
+  if (streamingPlayer) { streamingPlayer.stop(); streamingPlayer = null; }
+
   const startTime = performance.now();
 
   payload.response_format = 'wav';
@@ -701,7 +695,10 @@ async function generateFull(payload) {
   const blob = await resp.blob();
   const elapsed = performance.now() - startTime;
 
+  // Non-streaming: safe to play immediately via <audio> (no Web Audio conflict)
+  lastWavBlob = blob;
   playAudioBlob(blob);
+  document.getElementById('btn-replay').classList.remove('hidden');
 
   if (rtf && audioDuration) {
     appendLog(`Audio duration: ${parseFloat(audioDuration).toFixed(2)}s`);
